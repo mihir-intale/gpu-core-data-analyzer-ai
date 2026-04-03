@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Debug / temp data files
+backend/debug_scalar_df.csv
+backend/debug_vector_df.csv
+backend/temp_scalar_data.csv
+backend/temp_vector_data.csv
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore

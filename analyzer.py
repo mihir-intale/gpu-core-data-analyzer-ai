@@ -314,7 +314,7 @@ class BedrockLLM:
 class AnthropicLLM:
     """Anthropic LLM wrapper for Intel GNAI"""
     
-    def __init__(self, model: str = "claude-4-5-sonnet", base_url: str = "https://gnai.intel.com/api/providers/anthropic", max_tokens: int = 10000, gnai_token: Optional[str] = None, cert_path: Optional[str] = None):
+    def __init__(self, model: str = "claude-4-5-sonnet", base_url: str = "https://gnai.intel.com/api/providers/anthropic", max_tokens: int = 10000, gnai_token: Optional[str] = None, cert_path: Optional[str] = None, timeout: float = 600.0):
         """
         Initialize Anthropic LLM
         
@@ -324,10 +324,12 @@ class AnthropicLLM:
             max_tokens: Maximum tokens to generate (default: 10000)
             gnai_token: GNAI authentication token (default: reads from GNAI_TOKEN env var)
             cert_path: Path to SSL certificate bundle (default: C:\\Users\\mtale\\intel-certs\\intel-ca-bundle.crt)
+            timeout: Request timeout in seconds (default: 600 = 10 minutes)
         """
         self.model = model
         self.base_url = base_url
         self.max_tokens = max_tokens
+        self.timeout = timeout
         
         # Set up authentication token
         if gnai_token:
@@ -372,7 +374,7 @@ class AnthropicLLM:
             http_client = httpx.Client(
                 verify=ssl_context,
                 proxy=proxy,
-                timeout=30.0
+                timeout=self.timeout
             )
             
             # Create Anthropic client
@@ -437,39 +439,28 @@ class DataFrameAnalyzer:
             table_hash = hashlib.md5(column_string.encode()).hexdigest()[:8]
             table_name = f"table_{table_hash}"
             
-            # Build column metadata
+            # Build column metadata as "name (type)" pairs
             columns_info = []
             for col, dtype in df.dtypes.items():
                 # Map pandas dtypes to simplified types
                 if pd.api.types.is_numeric_dtype(dtype):
-                    col_type = "number" if pd.api.types.is_float_dtype(dtype) else "integer"
+                    col_type = "float" if pd.api.types.is_float_dtype(dtype) else "int"
                 elif pd.api.types.is_datetime64_any_dtype(dtype):
                     col_type = "datetime"
                 elif pd.api.types.is_bool_dtype(dtype):
-                    col_type = "boolean"
+                    col_type = "bool"
                 else:
-                    col_type = "text"
+                    col_type = "str"
                 
-                columns_info.append({
-                    "name": str(col),
-                    "type": col_type,
-                    "description": None,
-                    "expression": None,
-                    "alias": None
-                })
+                columns_info.append(f"{col} ({col_type})")
+            
+            columns_str = ", ".join(columns_info)
             
             # Build table info with description
             table_info = f'\n### DataFrame Variable: `{df_var_name}`\n'
             table_info += f'**Description:** {description}\n'
-            table_info += f'<table dialect="postgres" table_name="{table_name}" '
-            table_info += f'variable_name="{df_var_name}" '
-            table_info += f'columns="{json.dumps(columns_info, ensure_ascii=False)}" '
-            table_info += f'dimensions="{df.shape[0]}x{df.shape[1]}">\n'
-            
-            # Add CSV data (first 5 rows)
-            # df_head = df.head()
-            # table_info += df_head.to_csv(index=False)
-            table_info += "</table>\n"
+            table_info += f'**Shape:** {df.shape[0]} rows x {df.shape[1]} columns\n'
+            table_info += f'**Columns:** {columns_str}\n'
             
             all_tables_info.append(table_info)
         
@@ -497,7 +488,15 @@ Always follow these rules:
 5. Only use Plotly (type 'html') if the user explicitly requests interactive, plotly, or html output
 6. Use descriptive variable names and add comments for clarity
 
-You might get data between two or more driver versions of GPU and their improvement you may need to compare them."""
+Job comparison rules:
+- The data may contain multiple jobs identified by a 'job_id' column (format: "<id>: <name>")
+- The FIRST job (lowest index or first appearing in the data) is always the BASELINE
+- All other jobs are TARGET jobs to be compared against the baseline
+- When computing deltas or differences: delta = target_value - baseline_value
+- When computing ratios or improvements: ratio = target_value / baseline_value
+- Positive delta means the target improved over baseline; negative means regression
+- Always label results clearly indicating which job is baseline and which is target
+- Scurve definition: S-curve is plot where x-axis shows workload names and y-axis shows ratio of target to baseline for a specific metric. Workloads should be sorted by their ratio values from lowest to highest on the x-axis, and workload names should be rotated 180 degrees and if they are too long should show some part in the start then ellipses and then some part of the end for readability."""
 
         if self.initial_prompt:
             system_msg += "\nINITIAL USER PROMPT:\n " + self.initial_prompt

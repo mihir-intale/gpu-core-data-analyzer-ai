@@ -9,6 +9,9 @@ import sys
 import os
 import base64
 import tempfile
+import json
+import uuid
+from datetime import datetime, timezone
 
 # Add parent directory to path to import analyzer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -541,6 +544,7 @@ def chat_v2():
         data = request_data.get('data', [])
         jobs = request_data.get('jobs', [])
         message = request_data.get('message', '')
+        gnai_token = request_data.get('gnai_token', None)  # Optional: if not provided, falls back to GNAI_TOKEN env var
         
         # Validate inputs
         if not message:
@@ -597,7 +601,8 @@ def chat_v2():
         # )
         llm = AnthropicLLM(
             model="claude-4-5-sonnet",
-            base_url="https://gnai.intel.com/api/providers/anthropic"
+            base_url="https://gnai.intel.com/api/providers/anthropic",
+            gnai_token=gnai_token  # None falls back to GNAI_TOKEN env var
         )
         
         # Prepare dataframes list with descriptions
@@ -642,9 +647,244 @@ def chat_v2():
             'success': False,
             'error': str(e)
         }), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SKILLS  –  helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+SKILLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skills.json')
+
+
+def _load_skills() -> list:
+    """Load skills list from the JSON file."""
+    if not os.path.exists(SKILLS_FILE):
+        return []
+    with open(SKILLS_FILE, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data.get('skills', [])
+
+
+def _save_skills(skills: list) -> None:
+    """Persist the skills list to the JSON file."""
+    with open(SKILLS_FILE, 'w', encoding='utf-8') as f:
+        json.dump({'skills': skills}, f, indent=2, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GET /skills  –  return all saved skills (no code unless requested)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/skills', methods=['GET'])
+def get_skills():
+    """
+    Return all skills from skills.json.
+
+    Query params:
+      include_code=true  – also return the 'code' field (default: false)
+
+    Response:
+    {
+        "success": true,
+        "skills": [
+            {
+                "id": "...",
+                "name": "...",
+                "description": "...",
+                "is_default": true/false,
+                "tags": [...],
+                "created_at": "..."
+                // "code" only present when include_code=true
+            },
+            ...
+        ]
+    }
+    """
+    try:
+        include_code = request.args.get('include_code', 'false').lower() == 'true'
+        skills = _load_skills()
+
+        if not include_code:
+            skills = [{k: v for k, v in s.items() if k != 'code'} for s in skills]
+
+        return jsonify({'success': True, 'skills': skills}), 200
+
+    except Exception as e:
+        print(f"❌ /skills GET error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  POST /skills  –  save a new skill
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/skills', methods=['POST'])
+def save_skill():
+    """
+    Save a new skill (or overwrite an existing one by id).
+
+    Expected JSON body:
+    {
+        "name": "My Skill",                  # required
+        "description": "What it does",       # required
+        "code": "python code string...",     # required
+        "tags": ["tag1", "tag2"],            # optional
+        "is_default": false                  # optional, default false
+    }
+
+    You may also pass "id" to overwrite an existing skill.
+
+    Response:
+    {
+        "success": true,
+        "skill": { ...saved skill object... }
+    }
+    """
+    try:
+        body = request.get_json()
+        if not body:
+            return jsonify({'success': False, 'error': 'No JSON body provided'}), 400
+
+        name = body.get('name', '').strip()
+        description = body.get('description', '').strip()
+        code = body.get('code', '').strip()
+
+        if not name:
+            return jsonify({'success': False, 'error': '"name" is required'}), 400
+        if not code:
+            return jsonify({'success': False, 'error': '"code" is required'}), 400
+
+        skills = _load_skills()
+
+        # If an id is provided and already exists, replace it
+        skill_id = body.get('id', '').strip() or str(uuid.uuid4())
+        existing_idx = next((i for i, s in enumerate(skills) if s.get('id') == skill_id), None)
+
+        skill = {
+            'id': skill_id,
+            'name': name,
+            'description': description,
+            'code': code,
+            'is_default': bool(body.get('is_default', False)),
+            'tags': body.get('tags', []),
+            'created_at': body.get('created_at', datetime.now(timezone.utc).isoformat()),
+        }
+
+        if existing_idx is not None:
+            skills[existing_idx] = skill
+        else:
+            skills.append(skill)
+
+        _save_skills(skills)
+
+        return jsonify({'success': True, 'skill': skill}), 200
+
+    except Exception as e:
+        print(f"❌ /skills POST error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  POST /skills/run  –  execute a skill against supplied data
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/skills/run', methods=['POST'])
+def run_skill():
+    """
+    Execute a saved skill against job data and return the result.
+
+    Expected JSON body:
+    {
+        "skill_id": "some-skill-id",   # required – which skill to run
+        "data": [...],                 # required – same format as /chat_v2 data
+        "jobs": [...]                  # required – same format as /chat_v2 jobs
+    }
+
+    Returns the same envelope as /chat_v2:
+    {
+        "code": "...",      # the skill's Python code that was executed
+        "result": {...},    # blob-formatted result
+        "reply": "..."      # human-friendly description from the result dict
+    }
+    """
+    try:
+        body = request.get_json()
+        if not body:
+            return jsonify({'success': False, 'error': 'No JSON body provided'}), 400
+
+        skill_id = body.get('skill_id', '').strip()
+        data = body.get('data', [])
+        jobs = body.get('jobs', [])
+
+        if not skill_id:
+            return jsonify({'success': False, 'error': '"skill_id" is required'}), 400
+        if not data:
+            return jsonify({'success': False, 'error': '"data" is required'}), 400
+
+        # Look up the skill
+        skills = _load_skills()
+        skill = next((s for s in skills if s.get('id') == skill_id), None)
+        if skill is None:
+            return jsonify({'success': False, 'error': f'Skill "{skill_id}" not found'}), 404
+
+        code = skill.get('code', '')
+        if not code:
+            return jsonify({'success': False, 'error': 'Skill has no code'}), 400
+
+        # Build DataFrames from incoming data (same as chat_v2)
+        scalar_df, vector_df = process_job_details(data, jobs)
+
+        if scalar_df.empty and vector_df.empty:
+            return jsonify({'success': False, 'error': 'Both scalar and vector DataFrames are empty'}), 400
+
+        # Assemble dataframes list for the analyzer
+        dataframes = []
+        if not scalar_df.empty:
+            dataframes.append({
+                'dataframe': scalar_df,
+                'dataframe_description': (
+                    'Scalar performance metrics for each workload and job. '
+                    'Contains aggregated metrics like average FPS, percentile values, '
+                    'power consumption, etc. Each row is one workload for one job.'
+                )
+            })
+        if not vector_df.empty:
+            dataframes.append({
+                'dataframe': vector_df,
+                'dataframe_description': (
+                    'Time-series vector data for each workload and job. '
+                    'Contains frame-by-frame measurements. '
+                    'Each row represents a single timestamp with all measured metrics.'
+                )
+            })
+
+        # Execute the skill code directly (no LLM call needed)
+        analyzer = DataFrameAnalyzer(dataframes, llm=None, use_sandbox=True)
+        result = analyzer._execute_code(code)
+
+        # Extract reply
+        reply = result.get('reply', '') if isinstance(result, dict) else str(result)
+
+        # Convert result to blob for JSON transport
+        result_blob = convert_result_to_blob(result)
+
+        print(f"✅ Skill '{skill.get('name')}' executed successfully")
+
+        return jsonify({
+            'code': code,
+            'result': result_blob,
+            'reply': reply
+        }), 200
+
+    except Exception as e:
+        print(f"❌ /skills/run POST error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     try:
         # Check if Ollama is accessible
         import requests
@@ -675,8 +915,11 @@ def index():
         'endpoints': {
             '/chat': 'POST - Submit data and message for analysis (legacy format)',
             '/chat_v2': 'POST - Submit job details with scalars and vectors for analysis',
-            '/health': 'GET - Check API health status',
-            '/': 'GET - This information page'
+            '/skills': 'GET  - List all saved skills (add ?include_code=true for code)',
+            '/skills': 'POST - Save a new skill (name, description, code required)',
+            '/skills/run': 'POST - Run a saved skill against job data',
+            '/health': 'GET  - Check API health status',
+            '/': 'GET  - This information page'
         },
         'chat_example': {
             'url': '/chat',
